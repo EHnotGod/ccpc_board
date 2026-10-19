@@ -133,6 +133,126 @@ async function replay(page, seconds) {
     }, seconds);
 }
 
+async function settleReplay(page) {
+    await page.evaluate(async () => {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        await window.CCPCNewBoard.instance._rankRenderChain;
+    });
+}
+
+async function assertReplaySeconds(page, seconds, message, replayMode = true) {
+    await page.waitForFunction(({ seconds, replayMode }) => {
+        const rank = window.CCPCNewBoard.instance;
+        const actual = rank.timeReplayMode ? Number(rank.replayTime)
+            : Math.min(Number(rank.contestEndTime), Number(rank.GetActualCurrentTime()));
+        return rank.timeReplayMode === replayMode
+            && Math.abs((actual - Number(rank.contestStartTime)) / 1000 - seconds) < 0.01;
+    }, { seconds, replayMode });
+    await settleReplay(page);
+    const display = await page.locator('#time-progress-current').textContent();
+    const expected = [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
+        .map(value => String(value).padStart(2, '0')).join(':');
+    assert.equal(display.trim(), expected, `${message}: the displayed time must match the replay cutoff`);
+}
+
+async function assertMinuteControls(page, enabled = true) {
+    await page.waitForFunction(enabled => {
+        const state = window.CCPCNewBoard;
+        const slider = document.querySelector('#time-progress-slider');
+        return state?.enabled === enabled && state.instance?.rankList?.length
+            && document.querySelector('#ccpc-new-board-tools #ccpc-replay-back')
+            && document.querySelector('#ccpc-new-board-tools #ccpc-replay-forward')
+            && slider && (!enabled || Math.abs(Number(slider.step) - 1 / 3) < 1e-10);
+    }, enabled);
+    assert.equal(await page.locator('#ccpc-new-board-tools').count(), 1, 'only one toolbar may be mounted');
+    assert.equal(await page.locator('#ccpc-replay-back').count(), 1, 'only one back button may be mounted');
+    assert.equal(await page.locator('#ccpc-replay-forward').count(), 1, 'only one forward button may be mounted');
+    assert.equal(await page.locator('#ccpc-replay-back').textContent(), '\u22121 \u5206\u949f');
+    assert.equal(await page.locator('#ccpc-replay-forward').textContent(), '+1 \u5206\u949f');
+    const range = await page.locator('#time-progress-slider').evaluate(slider => ({
+        min: slider.min, max: slider.max, step: slider.step,
+    }));
+    assert.equal(range.min, '0', 'the native slider must retain its percentage range');
+    assert.equal(range.max, '100', 'the native slider must retain its percentage range');
+    if (enabled) assert.ok(Math.abs(Number(range.step) - 1 / 3) < 1e-10, 'one slider step must represent one minute in a five-hour contest');
+    else {
+        assert.ok(range.step === '' || Number(range.step) === 1, 'disabled mode must preserve the original slider step');
+        assert.ok(await page.locator('#ccpc-replay-back').isDisabled());
+        assert.ok(await page.locator('#ccpc-replay-forward').isDisabled());
+    }
+}
+
+async function minuteReplayControls(page, payload) {
+    await assertMinuteControls(page);
+    const back = page.locator('#ccpc-replay-back');
+    const forward = page.locator('#ccpc-replay-forward');
+    const slider = page.locator('#time-progress-slider');
+    assert.ok(await forward.isDisabled(), 'fast-forward must be disabled at the latest available time');
+    await back.click();
+    await assertReplaySeconds(page, 299 * 60, 'one back click');
+    await back.click({ clickCount: 5, delay: 1 });
+    await assertReplaySeconds(page, 294 * 60, 'five rapid back clicks must not lose steps');
+
+    // Exercise the native input/change listeners, rather than invoking the
+    // replay methods directly: the site only applies the rank on change.
+    await slider.focus();
+    await slider.press('ArrowLeft');
+    await assertReplaySeconds(page, 293 * 60, 'native slider ArrowLeft');
+    await slider.press('ArrowRight');
+    await assertReplaySeconds(page, 294 * 60, 'native slider ArrowRight');
+
+    await replay(page, 0);
+    assert.ok(await back.isDisabled(), 'back must be disabled at the contest start');
+    await forward.click();
+    await assertReplaySeconds(page, 60, 'one forward click from zero');
+    await slider.focus();
+    await slider.press('ArrowLeft');
+    await assertReplaySeconds(page, 0, 'native slider can reach the start exactly');
+    assert.ok(await back.isDisabled());
+
+    // A running contest has an effective latest time before the scheduled end,
+    // possibly between minute marks. Buttons must clamp to that actual time.
+    await page.evaluate(() => {
+        const rank = window.CCPCNewBoard.instance;
+        rank._minuteTestActualTime = rank.GetActualCurrentTime;
+        rank.GetActualCurrentTime = () => new Date(Number(rank.contestStartTime) + 7530 * 1000);
+        rank.ResetTimeReplay();
+    });
+    await assertReplaySeconds(page, 7530, 'running-contest latest', false);
+    assert.ok(await forward.isDisabled(), 'fast-forward must stop at actual current time before the contest end');
+    await back.click();
+    await assertReplaySeconds(page, 7470, 'back from a latest time between minute marks');
+    await forward.click();
+    await assertReplaySeconds(page, 7530, 'forward returns to the effective latest time', false);
+    assert.ok(await forward.isDisabled());
+    await page.evaluate(() => {
+        const rank = window.CCPCNewBoard.instance;
+        rank.GetActualCurrentTime = rank._minuteTestActualTime;
+        delete rank._minuteTestActualTime;
+        rank.ResetTimeReplay();
+    });
+    await settleReplay(page);
+
+    await page.evaluate(async payload => {
+        const rank = window.CCPCNewBoard.instance;
+        rank.OriInit(payload);
+        await rank._rankRenderChain;
+    }, payload);
+    await assertMinuteControls(page);
+    await page.locator('#header-controls #refresh-btn').click();
+    await settleReplay(page);
+    await assertMinuteControls(page);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await assertMinuteControls(page);
+
+    const toggle = page.locator('#ccpc-new-board-tools > button[aria-pressed]');
+    await Promise.all([page.waitForEvent('domcontentloaded'), toggle.click()]);
+    await assertMinuteControls(page, false);
+    await Promise.all([page.waitForEvent('domcontentloaded'), toggle.click()]);
+    await assertMinuteControls(page);
+    console.log('PASS minute replay: buttons, rapid clicks, native slider keys, start/live/end bounds, refresh/Init/reload, mode toggle');
+}
+
 async function snapshot(page) {
     return page.evaluate(() => {
         const rank = window.CCPCNewBoard.instance;
@@ -233,6 +353,7 @@ async function syntheticContest(browser) {
     const errors = monitor(page);
     await ready(page);
     assert.ok(requests > 0, 'the fixture must replace a real rank.json request');
+    await minuteReplayControls(page, payload);
 
     await replay(page, 3 * 3600 + 59 * 60);
     const before = await snapshot(page);
@@ -255,7 +376,17 @@ async function syntheticContest(browser) {
     assert.deepEqual(before.headerFinalCountFields, [], 'header data shared with the plain layout must omit final totals');
     await screenshot(page, 'fixture-before-four-hours.png');
 
-    await replay(page, 4 * 3600 + 6 * 60);
+    await page.locator('#ccpc-replay-forward').click();
+    await assertReplaySeconds(page, 4 * 3600, 'minute button crosses the four-hour freeze');
+    const atFreeze = await snapshot(page);
+    assert.deepEqual(atFreeze.revealed, ['A', 'B', 'C', 'D'], 'the minute button must publish all columns at exactly four hours');
+    await page.locator('#ccpc-replay-back').click();
+    await assertReplaySeconds(page, 3 * 3600 + 59 * 60, 'minute button reverses across the four-hour freeze');
+    const beforeAgain = await snapshot(page);
+    assert.deepEqual(beforeAgain.revealed, ['A'], 'the minute button must restore anonymous columns before four hours');
+    assertAnonymous(beforeAgain, 'button replay restored before four hours');
+    await page.locator('#ccpc-replay-forward').click({ clickCount: 7, delay: 1 });
+    await assertReplaySeconds(page, 4 * 3600 + 6 * 60, 'seven rapid forward clicks across the freeze');
     const frozen = await snapshot(page);
     assert.deepEqual(frozen.revealed, ['A', 'B', 'C', 'D'], 'all letters must be shown after four hours');
     assert.equal(frozen.privateCellCount, 0, 'the anonymous zone must close when all letters are public');
@@ -304,6 +435,10 @@ async function syntheticContest(browser) {
     assert.equal(details.summaryDac, 0, 'the summary table must not leak the frozen AC');
     assert.ok(!details.classes.includes('pro-first-blood'), 'the frozen AC must not receive a first-blood marker');
     await screenshot(page, 'fixture-frozen.png');
+
+    await page.locator('#time-reset-btn').click();
+    await assertReplaySeconds(page, 5 * 3600, 'the original reset button remains functional', false);
+    assert.ok(await page.locator('#ccpc-replay-forward').isDisabled(), 'reset must synchronize the new controls');
 
     await replay(page, 3 * 3600 + 59 * 60);
     const reverted = await snapshot(page);

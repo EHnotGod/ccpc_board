@@ -3,7 +3,7 @@
 // @namespace    ccpc-board
 // @homepageURL  https://github.com/EHnotGod/ccpc_board
 // @supportURL   https://github.com/EHnotGod/ccpc_board/issues
-// @version      0.1.0
+// @version      0.1.1
 // @description  复用 CCPC 外榜，按通过队数公开题号，并支持匿名进度、时间回放和四小时封榜。
 // @match        https://rank.iccpc.cn/r/*
 // @run-at       document-start
@@ -16,7 +16,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.1.0';
+    const VERSION = '0.1.1';
     const FREEZE_SECONDS = 4 * 60 * 60;
 
     function isContestant(team) {
@@ -141,6 +141,49 @@
             .map(n => String(n).padStart(2, '0')).join(':');
     }
 
+    function replayBounds(rs) {
+        if (!rs?.contestStartTime || !rs.contestEndTime) return null;
+        const start = Number(rs.contestStartTime), end = Number(rs.contestEndTime);
+        const now = Number(rs.GetActualCurrentTime());
+        if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(now) || end <= start) return null;
+        const latest = Math.max(start, Math.min(end, now));
+        const time = rs.timeReplayMode && rs.replayTime ? Number(rs.replayTime) : latest;
+        const current = Math.max(start, Math.min(latest, time));
+        return { start, end, latest, current };
+    }
+
+    function syncReplayControls() {
+        const rs = state.instance;
+        const bounds = enabled ? replayBounds(rs) : null;
+        const back = document.getElementById('ccpc-replay-back');
+        const forward = document.getElementById('ccpc-replay-forward');
+        if (back) back.disabled = !bounds || bounds.current <= bounds.start;
+        if (forward) forward.disabled = !bounds || bounds.current >= bounds.latest;
+        if (!bounds) return;
+        const slider = rs.GetHeaderElement()?.querySelector('#time-progress-slider');
+        if (!slider) return;
+        // 原站使用百分比范围；按比赛时长换算，让每一格对应 60 秒。
+        const step = String(60000 / (bounds.end - bounds.start) * 100);
+        if (slider.step !== step) slider.step = step;
+    }
+
+    function shiftReplay(minutes) {
+        const rs = state.instance;
+        const bounds = enabled ? replayBounds(rs) : null;
+        if (!bounds) return;
+        const target = Math.max(bounds.start, Math.min(bounds.latest, bounds.current + minutes * 60000));
+        if (target === bounds.current) return;
+        if (target >= bounds.latest) {
+            rs.ResetTimeReplay();
+        } else {
+            rs.replayTime = new Date(target);
+            const slider = rs.GetHeaderElement()?.querySelector('#time-progress-slider');
+            if (slider) slider.value = String((target - bounds.start) / (bounds.end - bounds.start) * 100);
+            rs.ApplyTimeReplay();
+        }
+        syncReplayControls();
+    }
+
     // 原站不把 CE / 评测中的提交计入罚时。补充展示这些提交，排名仍由原站计算。
     function includeAllAttempts(rs) {
         const rows = new Map((rs.rankList || []).map(row => [String(row.team_id), row]));
@@ -202,6 +245,27 @@
         const originalHeader = rs.CreateProblemHeaderColumn;
         const originalPopover = rs.CreateProblemStatusPopoverAttrs;
         const describe = baseClass.prototype.DescribeProblemCell;
+
+        for (const name of ['InitializeTimeProgress', 'ApplyTimeReplay', 'ResetTimeReplay']) {
+            const original = rs[name];
+            rs[name] = function () {
+                const result = original.apply(this, arguments);
+                syncReplayControls();
+                return result;
+            };
+        }
+        const setReplayTime = rs.SetReplayTime;
+        rs.SetReplayTime = function () {
+            const result = setReplayTime.apply(this, arguments);
+            if (this.replayTime && this.contestStartTime) {
+                const start = Number(this.contestStartTime);
+                const elapsed = Number(this.replayTime) - start;
+                const minute = Math.round(elapsed / 60000) * 60000;
+                // range 的小数百分比可能造成毫秒误差，避免 1 分钟显示成 59 秒。
+                if (Math.abs(elapsed - minute) < 10) this.replayTime = new Date(start + minute);
+            }
+            return result;
+        };
 
         rs.IsFrozen = function (solution) {
             return originalFrozen.call(this, solution)
@@ -382,6 +446,7 @@
         style.textContent = `
             #ccpc-new-board-tools { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin:0 0 12px; font-size:13px; }
             #ccpc-new-board-status { opacity:.8; }
+            #ccpc-new-board-tools button:disabled { opacity:.5; cursor:default; }
             .problem-group:has(.ccpc-public-zone), .pro-header-group:has(.ccpc-public-zone),
             .ccpc-public-zone, .ccpc-private-zone, .ccpc-private-zone-head {
                 display:flex; flex-wrap:nowrap; gap:var(--rank-col-gap); min-width:0;
@@ -407,8 +472,24 @@
         const status = document.createElement('span');
         status.id = 'ccpc-new-board-status';
         status.setAttribute('role', 'status');
-        toolbar.append(button, status);
+        toolbar.append(button);
+        for (const [id, label, minutes] of [
+            ['ccpc-replay-back', '−1 分钟', -1],
+            ['ccpc-replay-forward', '+1 分钟', 1]
+        ]) {
+            const control = document.createElement('button');
+            control.id = id;
+            control.type = 'button';
+            control.className = 'btn btn--sm';
+            control.textContent = label;
+            control.disabled = true;
+            control.setAttribute('aria-label', minutes < 0 ? '回放时间后退 1 分钟' : '回放时间前进 1 分钟');
+            control.addEventListener('click', () => shiftReplay(minutes));
+            toolbar.append(control);
+        }
+        toolbar.append(status);
         anchor.after(toolbar);
+        syncReplayControls();
         updateStatus();
     }
 
@@ -451,6 +532,7 @@
             rs.UpdateRank();
         }
         updateStatus();
+        syncReplayControls();
         if (enabled && !rs && document.querySelector('#rank-grid > [data-row-id]')) {
             const el = document.getElementById('ccpc-new-board-status');
             if (el) el.textContent = '脚本加载较晚，请刷新页面以启用新模式';
