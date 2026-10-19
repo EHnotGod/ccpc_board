@@ -1,0 +1,11 @@
+node_modules/
+
+# 本地采集的榜单数据，不随源码发布。
+/ccpc-网页提取结果.json
+
+# 本地配置与系统文件。
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

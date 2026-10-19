@@ -1,0 +1,12 @@
+{
+  "name": "ccpc-new-board-userscript",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "CCPC 外榜匿名题目模式油猴脚本",
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "check": "node --check ccpc-new-board.user.js",
+    "test:browser": "node tests/browser-smoke.cjs"
+  }
+}
